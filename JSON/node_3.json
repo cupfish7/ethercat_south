@@ -1,0 +1,45 @@
+{
+  "prefix": "plant1",
+  "protocol": "powerlink",
+  "node": "motor_2",
+  "slave": "1",
+
+  "period_ms": 1,
+  "publish": "in",
+
+  "tags": {
+    "count": 3,
+    "tag": [
+      {
+        "address": "0x6064:00",
+        "raw_type": "i32",
+        "value_type": "f64",
+        "direction": "in",
+        "offset": 0,
+        "scale": 0.01,
+        "unit": "°",
+        "name": "position_actual"
+      },
+      {
+        "address": "0x606C:00",
+        "raw_type": "i32",
+        "value_type": "f64",
+        "direction": "in",
+        "offset": 4,
+        "scale": 1,
+        "unit": "r/min",
+        "name": "speed_actual"
+      },
+      {
+        "address": "0x6041:00",
+        "raw_type": "u16",
+        "value_type": "u16",
+        "direction": "in",
+        "offset": 8,
+        "scale": 1,
+        "unit": "none",
+        "name": "statusword"
+      }
+    ]
+  }
+}

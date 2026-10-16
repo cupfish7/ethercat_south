@@ -1,0 +1,36 @@
+{
+"prefix": "plant1",
+"protocol": "modbus-tcp",
+"node": "bolier",                
+"slave": "192.168.1.10:502/1",    
+
+"period_ms": 100,
+"publish": "in",
+
+"tags": {
+  "count": 2,
+  "tag": [
+    {
+      "address": "holding:40001",
+      "raw_type": "u16",
+      "value_type": "f64",
+      "direction": "in",
+      "offset": 0,          
+      "unit": "℃",
+      "scale": 0.1,
+      "name": "boiler_temp"
+    },
+    {
+      "address": "holding:40002",
+      "raw_type": "u32",
+      "value_type": "f64",
+      "direction": "in",
+      "offset": 2,
+      "unit": "kPa",
+      "scale": 0.01,
+      "name": "boiler_pressure"
+    }
+  ]
+}
+}
+

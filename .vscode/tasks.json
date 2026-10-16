@@ -1,0 +1,59 @@
+{
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "C: 语法检查（全部模块）",
+            "command": "C:\\mingw64\\bin\\gcc.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-fsyntax-only",
+                "-Wall",
+                "-Wextra",
+                "-finput-charset=UTF-8",
+                "-fexec-charset=UTF-8",
+                "-I", "${fileDirname}\\compat",
+                "-I", "${fileDirname}",
+                "-I", "${fileDirname}\\..\\ethercat-1.6-stable\\include",
+                "${fileDirname}\\main.c",
+                "${fileDirname}\\ethercat_south_parse.c",
+                "${fileDirname}\\ethercat_south_connect.c",
+                "${fileDirname}\\ethercat_south_read.c",
+                "${fileDirname}\\ethercat_south_collector.c"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Windows 上只能语法检查 —— 没有 libethercat，链接不出可执行文件。五个模块一次过。compat/ 是 netinet/in.h 的 Windows 垫片，ethercat-1.6-stable/include 提供 ecrt.h。"
+        },
+        {
+            "type": "cppbuild",
+            "label": "C/C++: gcc.exe 生成活动文件",
+            "command": "C:\\mingw64\\bin\\gcc.exe",
+            "args": [
+                "-fdiagnostics-color=always",
+                "-g",
+                "${file}",
+                "-o",
+                "${fileDirname}\\${fileBasenameNoExtension}.exe"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build"
+            },
+            "detail": "通用单文件编译。只编当前文件、不链接 cJSON，所以只对自成一体的程序有用（比如 shm_demo.c）。"
+        }
+    ],
+    "version": "2.0.0"
+}

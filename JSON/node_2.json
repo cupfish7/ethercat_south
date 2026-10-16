@@ -1,0 +1,40 @@
+
+{
+  "prefix": "plant1",
+  "protocol": "ethercat",
+  "node": "motor_1",
+  "slave": "0/0",        
+  "vendor_id":"0x00004321",
+  "product_code":"0x000000e2",
+  "period_ms": 1,
+  "MODE": DC ,
+
+  "tags": {
+    "count": 2,
+    "tag": [
+      {
+
+        "address": "0x6064:00",
+        "raw_type": "i32",
+        "value_type": "f64",
+        "direction": "in",
+        "offset": 0, 
+        "scale": 0.01,
+        "unit": "°",
+        "name": "position_actual"
+      },
+      {
+
+
+        "address": "0x6041:00",
+        "raw_type": "u16",
+        "value_type": "u16",
+        "direction": "in",
+        "offset": 8, 
+        "scale": 1,
+        "unit": "none",
+        "name": "statusword"
+      }
+    ]
+  }
+}

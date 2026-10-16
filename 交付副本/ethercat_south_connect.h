@@ -1,0 +1,36 @@
+#ifndef ETHERCAT_SOUTH_CONNECT_H
+#define ETHERCAT_SOUTH_CONNECT_H
+
+#include "ethercat_south_parse.h"      /* 用到 Config / SlaveConfig / TagConfig */
+#include "ecrt.h"                      /* conn 里有 ec_master_t / ec_domain_t */
+
+#define MAX_DOMAINS 16      /* 不同的采样周期最多这么多种 */
+
+/* 主站连接与启动的产出，由调用方持有。
+   约 33 KB（光 tag_offset[128][64] 就 32 KB）—— 所以只能调用方分配、传指针，
+   不能按值返回，也不能放栈上。
+
+   生命周期约定：调 ethercat_south_master_start() 填好，之后 read 只读它。 */
+typedef struct {
+    const Config *config;                            /* 从站元数据（tag 类型等），read 要用 */
+
+    ec_master_t  *master;                            /* 请求到的主站句柄 */
+    int           domain_count;                      /* 建了几个域 */
+    ec_domain_t  *domains[MAX_DOMAINS];              /* 每个采样周期一个域 */
+    int           domain_period[MAX_DOMAINS];        /* 该域服务的采样周期 [ms] */
+    uint8_t      *domain_pd[MAX_DOMAINS];            /* 各自的过程映像基址，activate 之后才有 */
+
+    int           slave_domain[MAX_SLAVES];          /* 从站 i → 域下标；-1 = 跳过 / 周期无效 */
+    unsigned int  tag_offset[MAX_SLAVES][MAX_TAGS];  /* tag j 在 domain_pd[slave_domain[i]] 里的字节偏移 */
+} ethercat_south_conn_t;
+
+/* 按配置启动 EtherCAT 主站：请求主站 → 按采样周期建域 → 注册 PDO 条目 →
+   激活 → 取各自的过程映像。结果全部写进 conn。
+   protocol != "ethercat" 的从站会被跳过。
+   返回 0 成功；-1 失败（失败时不自动 release 主站，由调用方决定）。 */
+int ethercat_south_master_start(const Config *config, ethercat_south_conn_t *conn);
+
+/* 测试/演示：加载 JSON 配置 → ethercat_south_master_start() → 打印域清单与过程映像偏移。 */
+void ethercat_south_connect_test(void);
+
+#endif /* ETHERCAT_SOUTH_CONNECT_H */
