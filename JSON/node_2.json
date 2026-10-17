@@ -10,7 +10,7 @@
   "MODE": "DC" ,
 
   "tags": {
-    "count": 2,
+    "count": 6,
     "tag": [
       {
 
@@ -33,6 +33,46 @@
         "scale": 1,
         "unit": "none",
         "name": "statusword"
+      },
+      {
+        "address": "0x6040:00",
+        "raw_type": "u16",
+        "value_type": "u16",
+        "direction": "out",
+        "offset": 0,
+        "scale": 1,
+        "unit": "none",
+        "name": "controlword"
+      },
+      {
+        "address": "0x607a:00",
+        "raw_type": "i32",
+        "value_type": "f64",
+        "direction": "out",
+        "offset": 0,
+        "scale": 1,
+        "unit": "none",
+        "name": "target_position"
+      },
+      {
+        "address": "0x6061:00",
+        "raw_type": "i8",
+        "value_type": "i8",
+        "direction": "in",
+        "offset": 0,
+        "scale": 1,
+        "unit": "none",
+        "name": "mode_display"
+      },
+      {
+        "address": "0x603f:00",
+        "raw_type": "u16",
+        "value_type": "u16",
+        "direction": "in",
+        "offset": 0,
+        "scale": 1,
+        "unit": "none",
+        "name": "error_code"
       }
     ]
   }
