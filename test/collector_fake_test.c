@@ -47,7 +47,10 @@ int main(void)
     printf("\n=== 1. collector_start（内部走真 connect）===\n");
     check("返回 0", ethercat_south_collector_start(&col, &cfg) == 0);
     check("建了 2 个域（按采样周期分）", col.conn.domain_count == 2);
-    check("域周期 {1, 10}", col.conn.domain_period[0] == 1 && col.conn.domain_period[1] == 10);
+    /* 域现在按容量分组、没有"周期"属性了 —— 这条旧断言换成新的语义。
+       ⚠️ 这个测试整体还是按旧的 2 从站配置写的，需要重写（见文件末尾的说明）。 */
+    check("按容量分组：每个从站都有归属域",
+          col.conn.domain_count >= 1 && col.conn.slave_domain[0] >= 0);
     check("从站0→域0、从站1→域1",
           col.conn.slave_domain[0] == 0 && col.conn.slave_domain[1] == 1);
     check("过程映像拿到了，且两个域不是同一块",

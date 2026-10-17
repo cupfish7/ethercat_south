@@ -13,7 +13,7 @@
                 "-fexec-charset=UTF-8",
                 "-I", "${fileDirname}\\compat",
                 "-I", "${fileDirname}",
-                "-I", "${fileDirname}\\..\\ethercat-1.6-stable\\include",
+                "-I", "${fileDirname}\\..\\ethercat-1_6-stable\\include",
                 "${fileDirname}\\main.c",
                 "${fileDirname}\\ethercat_south_parse.c",
                 "${fileDirname}\\ethercat_south_connect.c",
@@ -30,7 +30,7 @@
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Windows 上只能语法检查 —— 没有 libethercat，链接不出可执行文件。五个模块一次过。compat/ 是 netinet/in.h 的 Windows 垫片，ethercat-1.6-stable/include 提供 ecrt.h。"
+            "detail": "Windows 上只能语法检查 —— 没有 libethercat，链接不出可执行文件。五个模块一次过。compat/ 是 netinet/in.h 的 Windows 垫片，ethercat-1_6-stable/include 提供 ecrt.h。"
         },
         {
             "type": "cppbuild",

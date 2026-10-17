@@ -21,7 +21,7 @@ typedef struct {
 
     /* ---- 分频调度状态 ---- */
     uint64_t base_ms;                        /* 启动时刻（单调 ms），仅用于诊断 */
-    uint64_t next_due_ms[MAX_DOMAINS];       /* 各域的下次到点时刻（单调 ms，与 now_ms 同基准） */
+    uint64_t next_due_ms[MAX_SLAVES];        /* 各**从站**的下次到点时刻（单调 ms，与 now_ms 同基准） */
     uint64_t tick_count;                     /* 跑了多少拍 */
     uint64_t read_count[MAX_SLAVES];         /* 每个从站累计读了多少帧 */
     uint64_t wc_bad_count;                   /* 有多少拍里至少有一个域的工作计数器不正常 */

@@ -62,6 +62,11 @@ static int domain_index_of(const ec_domain_t *d)
 
 /* ---------- 被顶掉的 IgH 用户态 API ---------- */
 
+void ecrt_release_master(ec_master_t *master)
+{
+    (void)master;                   /* 假：什么也不做 */
+}
+
 ec_master_t *ecrt_request_master(unsigned int master_index)
 {
     (void)master_index;
@@ -124,6 +129,14 @@ uint8_t *ecrt_domain_data(const ec_domain_t *domain)
 {
     int k = domain_index_of(domain);
     return (k < 0) ? NULL : &g_pd[k][0];
+}
+
+/* 假：把"已注册的累计偏移"当作域大小。
+   ⚠️ 真 IgH 里这个值在 activate 之前是未文档化行为，这里只是让测试能跑。 */
+size_t ecrt_domain_size(const ec_domain_t *domain)
+{
+    int k = domain_index_of(domain);
+    return (k < 0) ? (size_t)-1 : (size_t)g_domain_off[k];
 }
 
 int ecrt_master_receive(ec_master_t *master)   { (void)master; g_stub_receive_calls++; return 0; }

@@ -140,14 +140,16 @@ static uint64_t gcd_u64(uint64_t a, uint64_t b)
     return a;
 }
 
-/* 各域周期的最大公约数。返回 0 表示一个有效周期都没有。 */
-static uint64_t domains_gcd(const ethercat_south_collector_t *c)
+/* 各从站采样周期的最大公约数（调试模式的定拍步长）。返回 0 表示一个有效周期都没有。
+   注意：分频现在是**按从站**的 —— 域不再有"周期"这个属性（它按容量分组），
+   所以这里遍历从站而不是域。 */
+static uint64_t slaves_gcd(const ethercat_south_collector_t *c)
 {
     uint64_t g = 0;
-    int k;
+    int i;
 
-    for (k = 0; k < c->conn.domain_count; k++) {
-        uint64_t p = (uint64_t)c->conn.domain_period[k];
+    for (i = 0; i < c->config->slave_count; i++) {
+        uint64_t p = (uint64_t)c->config->slaves[i].period_ms;
         if (p == 0) continue;
         g = (g == 0) ? p : gcd_u64(g, p);
     }
@@ -179,32 +181,33 @@ static void collector_setup_realtime(void)
 
 int ethercat_south_collector_start(ethercat_south_collector_t *c, const Config *config)
 {
-    int k;
+    int i;
 
     if (c == NULL || config == NULL) return -1;
 
     memset(c, 0, sizeof(*c));
     c->config = config;
 
-    /* 建主站 → 按采样周期建域 → 注册 PDO 条目 → 激活 → 取各自的过程映像。
+    /* 建主站 → 按容量分域 → 注册 PDO 条目 → 激活 → 取各自的过程映像。
        这一整段都在 connect 模块里，collector 不重复它的逻辑。 */
     if (ethercat_south_master_start(config, &c->conn) != 0) {
         printf("主站启动失败\n");
         return -1;
     }
 
-    /* 调度状态初始化：每个域第一次到点 = 启动时刻 + 它自己的周期 */
+    /* 调度状态初始化：**按从站** —— 每个从站第一次到点 = 启动时刻 + 它自己的 period_ms。
+       域不再有"周期"属性（它按容量分组），所以分频只能落在从站上。 */
     c->base_ms        = ethercat_south_collector_now_ms();
     c->last_report_ms = c->base_ms;
-    for (k = 0; k < c->conn.domain_count; k++)
-        c->next_due_ms[k] = c->base_ms + (uint64_t)c->conn.domain_period[k];
+    for (i = 0; i < config->slave_count; i++) {
+        int p = config->slaves[i].period_ms;
+        c->next_due_ms[i] = c->base_ms + (uint64_t)((p > 0) ? p : 1);
+    }
 
     collector_setup_realtime();
 
-    printf("collector 就绪：%d 个域、%d 个从站\n",
-           c->conn.domain_count, config->slave_count);
-    for (k = 0; k < c->conn.domain_count; k++)
-        printf("  域 %d: period %d ms\n", k, c->conn.domain_period[k]);
+    printf("collector 就绪：1 个域、%d 个从站（域 %lu 字节）\n",
+           config->slave_count, (unsigned long)ecrt_domain_size(c->conn.domain));
 
     return 0;
 }
@@ -214,7 +217,7 @@ int ethercat_south_collector_start(ethercat_south_collector_t *c, const Config *
 int ethercat_south_collector_tick(ethercat_south_collector_t *c, uint64_t now_ms)
 {
     uint64_t received_at;
-    int i, k;
+    int i;
 
     if (c == NULL || c->config == NULL) return -1;
     if (c->conn.master == NULL) return -1;
@@ -223,62 +226,52 @@ int ethercat_south_collector_tick(ethercat_south_collector_t *c, uint64_t now_ms
     ecrt_master_receive(c->conn.master);
     received_at = now_ms;      /* 紧接 receive 打戳，这就是 read 要的 source_received_at_ms */
 
-    /* ② 所有域都 process（不是只处理到点的）—— 非到点域的数据流也不能断 */
-    for (k = 0; k < c->conn.domain_count; k++)
-        ecrt_domain_process(c->conn.domains[k]);
+    /* ② process —— 只有一个域，每拍都做（数据流不能断） */
+    ecrt_domain_process(c->conn.domain);
 
     /* ③ 查工作计数器 —— 这是"从站没起来 / 掉线"的**唯一防线**。
           没有它，过程映像里可能全是 0 或上次的残值，而 read 照读不误、帧序列照涨，
           下游拿到一条看起来完全健康的流水线。ecrt_domain_state 必须在
           domain_process 之后调才有意义（它读的是上一轮交换的结果）。 */
     {
-        int bad = 0;
+        ec_domain_state_t ds;
 
-        for (k = 0; k < c->conn.domain_count; k++) {
-            ec_domain_state_t ds;
-
-            if (ecrt_domain_state(c->conn.domains[k], &ds) != 0) continue;
-            if (ds.wc_state != EC_WC_COMPLETE) bad = 1;
-        }
-        if (bad) c->wc_bad_count++;      /* 按"拍"计：这一拍至少有一个域不正常 */
+        if (ecrt_domain_state(c->conn.domain, &ds) == 0 &&
+            ds.wc_state != EC_WC_COMPLETE)
+            c->wc_bad_count++;           /* 这一拍工作计数器不正常 */
     }
 
-    /* ④ 只有到点的域才 read */
-    for (k = 0; k < c->conn.domain_count; k++) {
+    /* ④ 只有到点的**从站**才 read —— 分频按从站（域只有一个，没有周期属性） */
+    for (i = 0; i < c->config->slave_count; i++) {
         int period;
 
-        if (now_ms < c->next_due_ms[k]) continue;          /* 没到点，跳过 */
+        if (now_ms < c->next_due_ms[i]) continue;          /* 这个从站没到点 */
+        if (c->conn.domain_pd == NULL) continue;           /* 还没 activate */
 
-        period = c->conn.domain_period[k];
+        period = c->config->slaves[i].period_ms;
         if (period <= 0) continue;                         /* 周期无效，读不了也不排下一拍 */
 
-        for (i = 0; i < c->config->slave_count; i++) {
-            if (c->conn.slave_domain[i] != k) continue;    /* 这个从站不属于本域 */
+        /* L6N 控制：先跑 CiA402 状态机（读状态字、写控制字/目标位置），再走采集。
+           两件事都写进同一块过程映像，随后一起 queue 出去 —— 顺序不能反，
+           否则这一拍发出去的是上一拍的控制字。
+           ⚠️ 过了使能阶段它会让电机真的转，见 ethercat_south_l6n_control.h。 */
+        ethercat_south_l6n_step(&c->conn.l6n[i], c->conn.domain_pd, now_ms);
 
-            /* L6N 控制：先跑 CiA402 状态机（读状态字、写控制字/目标位置），再走采集。
-               两件事都写进同一块过程映像，随后一起 queue 出去 —— 顺序不能反，
-               否则这一拍发出去的是上一拍的控制字。
-               只在"该域到点"的拍上跑：那个周期才是这个从站的控制周期。
-               ⚠️ 过了使能阶段它会让电机真的转，见 ethercat_south_l6n_control.h。 */
-            ethercat_south_l6n_step(&c->conn.l6n[i], c->conn.domain_pd[k], now_ms);
-
-            if (ethercat_south_read_node(&c->conn, i, received_at, &c->frame) == 0) {
-                c->read_count[i]++;
-                /* TODO: 推送 —— 队列建好后在这里把 &c->frame 投给下游。
-                   本轮只到"周期读取"，读完的帧下一拍就被覆盖。 */
-            }
+        if (ethercat_south_read_node(&c->conn, i, received_at, &c->frame) == 0) {
+            c->read_count[i]++;
+            /* TODO: 推送 —— 队列建好后在这里把 &c->frame 投给下游。
+               本轮只到"周期读取"，读完的帧下一拍就被覆盖。 */
         }
 
         /* 排下一拍。落后超过一整拍就跳过去对齐，**不补读** ——
            一次停顿若引发一串补读，会越滚越糟；宁可丢拍也要跟上节奏。 */
-        c->next_due_ms[k] += (uint64_t)period;
-        while (c->next_due_ms[k] <= now_ms)
-            c->next_due_ms[k] += (uint64_t)period;
+        c->next_due_ms[i] += (uint64_t)period;
+        while (c->next_due_ms[i] <= now_ms)
+            c->next_due_ms[i] += (uint64_t)period;
     }
 
-    /* ⑤ 所有域都 queue，再 send */
-    for (k = 0; k < c->conn.domain_count; k++)
-        ecrt_domain_queue(c->conn.domains[k]);
+    /* ⑤ queue + send */
+    ecrt_domain_queue(c->conn.domain);
     ecrt_master_send(c->conn.master);
 
     c->tick_count++;
@@ -316,13 +309,13 @@ int ethercat_south_collector_run(ethercat_south_collector_t *c)
 
     while (!g_stop) {
         uint64_t nearest = 0;
-        int k, rc;
+        int i, rc;
 
-        for (k = 0; k < c->conn.domain_count; k++) {
-            if (nearest == 0 || c->next_due_ms[k] < nearest)
-                nearest = c->next_due_ms[k];
+        for (i = 0; i < c->config->slave_count; i++) {
+            if (nearest == 0 || c->next_due_ms[i] < nearest)
+                nearest = c->next_due_ms[i];
         }
-        if (nearest == 0) return -1;              /* 一个域都没有，没什么可跑的 */
+        if (nearest == 0) return -1;              /* 一个从站都没有，没什么可跑的 */
 
         rc = sleep_until_ms(nearest);
         if (g_stop) break;                        /* 因退出请求而返回：不是错误 */
@@ -342,7 +335,7 @@ int ethercat_south_collector_run_debug(ethercat_south_collector_t *c, uint64_t t
 
     if (c == NULL) return -1;
 
-    step = (tick_ms != 0) ? tick_ms : domains_gcd(c);
+    step = (tick_ms != 0) ? tick_ms : slaves_gcd(c);
     if (step == 0) return -1;
 
     signal(SIGINT,  collector_on_signal);
@@ -388,10 +381,9 @@ static int any_l6n_enabled(const ethercat_south_collector_t *c)
 
     for (i = 0; i < c->config->slave_count; i++) {
         const ethercat_south_l6n_t *l = &c->conn.l6n[i];
-        int k = c->conn.slave_domain[i];
 
-        if (!l->registered || k < 0 || c->conn.domain_pd[k] == NULL) continue;
-        if ((EC_READ_U16(c->conn.domain_pd[k] + l->off_status_word) & 0x0004) != 0)
+        if (!l->registered || c->conn.domain_pd == NULL) continue;
+        if ((EC_READ_U16(c->conn.domain_pd + l->off_status_word) & 0x0004) != 0)
             return 1;
     }
     return 0;
@@ -406,10 +398,8 @@ void ethercat_south_collector_stop(ethercat_south_collector_t *c)
 
     /* ① 给每个从站发"退出使能"的控制字（只写进过程映像，还没发出去） */
     for (i = 0; i < c->config->slave_count; i++) {
-        int k = c->conn.slave_domain[i];
-
-        if (k < 0 || c->conn.domain_pd[k] == NULL) continue;
-        ethercat_south_l6n_shutdown(&c->conn.l6n[i], c->conn.domain_pd[k]);
+        if (c->conn.domain_pd == NULL) break;
+        ethercat_south_l6n_shutdown(&c->conn.l6n[i], c->conn.domain_pd);
     }
 
     /* ② 再跑若干拍 —— **这一步不能省**。

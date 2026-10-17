@@ -14,8 +14,7 @@
  *    [ethercat_south_conn_t]              ← connect 产出，调用方持有
  *          │  slave_index
  *          ▼
- *    ①  conn->slave_domain[slave_index]   → 域下标 k（-1 直接返回错误）
- *    ②  conn->domain_pd[k]                → 该域的过程映像基址
+ *    ①  conn->domain_pd                   → 过程映像基址（只有一个域）
  *          ▼
  *    ③  逐 tag j：
  *          conn->tag_offset[slave_index][j]     → 该条目在过程映像里的字节偏移
@@ -167,18 +166,15 @@ int ethercat_south_read_node(const ethercat_south_conn_t *conn,
 {
     const SlaveConfig *s;
     uint8_t *base;
-    int k, j;
+    int j;
 
     /* ---------- 前置条件 ---------- */
     if (conn == NULL || conn->config == NULL || out == NULL) return -1;
     if (slave_index < 0 || slave_index >= conn->config->slave_count) return -1;
-
-    k = conn->slave_domain[slave_index];
-    if (k < 0 || k >= conn->domain_count) return -1;   /* 该从站被跳过 / 周期无效 */
-    if (conn->domain_pd[k] == NULL) return -1;         /* 还没 activate，过程映像还没映射 */
+    if (conn->domain_pd == NULL) return -1;            /* 还没 activate，过程映像还没映射 */
 
     s    = &conn->config->slaves[slave_index];
-    base = conn->domain_pd[k];
+    base = conn->domain_pd;
 
     /* ---------- 帧头 ---------- */
     memset(out, 0, sizeof(*out));

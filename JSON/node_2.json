@@ -7,7 +7,7 @@
   "vendor_id":"0x00004321",
   "product_code":"0x000000e2",
   "period_ms": 1,
-  "MODE": DC ,
+  "MODE": "DC" ,
 
   "tags": {
     "count": 2,
@@ -25,12 +25,11 @@
       },
       {
 
-
         "address": "0x6041:00",
         "raw_type": "u16",
         "value_type": "u16",
         "direction": "in",
-        "offset": 8, 
+        "offset": 0, 
         "scale": 1,
         "unit": "none",
         "name": "statusword"
