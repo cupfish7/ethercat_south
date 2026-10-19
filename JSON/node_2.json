@@ -1,35 +1,56 @@
-
 {
   "prefix": "plant1",
   "protocol": "ethercat",
   "node": "motor_1",
-  "slave": "0/0",        
-  "vendor_id":"0x00004321",
-  "product_code":"0x000000e2",
+
+  "Alias_Address": "0",
+  "Position": "0",
+  "vendor_id": "0x00004321",
+  "product_code": "0x000000e2",
+
+  "mode": "dc",                       
   "period_ms": 1,
-  "MODE": "DC" ,
+
+  "dc": {
+    "assign_activate": "0x0300",
+    "sync0_cycle_ns": 1000000,
+    "sync0_shift_ns": 0,
+    "sync1_cycle_ns": 0,
+    "sync1_shift_ns": 0
+  },
+
+  "start_sdo": {
+    "count": 1,
+    "sdo": [
+      {
+      "address": "0x6060:00",
+      "data_type": "i8",
+      "data_hex": "08",
+      "transition": "PS",
+      "apply": false
+      }
+    ]
+  },
 
   "tags": {
     "count": 6,
     "tag": [
       {
-
         "address": "0x6064:00",
         "raw_type": "i32",
         "value_type": "f64",
         "direction": "in",
-        "offset": 0, 
+        "offset": 0,
         "scale": 0.01,
         "unit": "°",
         "name": "position_actual"
       },
       {
-
         "address": "0x6041:00",
         "raw_type": "u16",
         "value_type": "u16",
         "direction": "in",
-        "offset": 0, 
+        "offset": 0,
         "scale": 1,
         "unit": "none",
         "name": "statusword"
