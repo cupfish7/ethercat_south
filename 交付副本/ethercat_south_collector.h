@@ -6,70 +6,74 @@
 /* 南向模块的主库：把 parse / connect / read 组装起来。
  *
  * 组装关系：
- *     parse    JSON → Config            （通用工具，别的程序也能用）
- *     connect  Config → conn            （建主站、按采样周期建域、注册 PDO、激活）
- *     read     conn + 从站下标 → 一帧   （只取数，不驱动周期）
- *     collector（本模块）               （串起上面三个 + 按各域周期分频调 read）
+ *     parse    JSON → Config
+ *     connect  Config → conn
+ *     read     conn + 从站下标 → 一帧
+ *     collector（本模块）              串起上面三个 + 周期调度
  *
- * 时间单位统一：所有 "ms" 都是**单调毫秒**，基准与 ethercat_south_collector_now_ms() 相同。 */
+ * 调度：
+ *   - 任一从站 mode==dc  → 固定 1 ms 循环，每拍设置 application time 并做 DC 同步；
+ *   - 全部 freerun/sm    → 睡到最近一个从站到点的 ms 调度。
+ *   period_ms 始终是**采样周期**（read 的周期），DC 周期由 dc.sync0_cycle_ns 决定。
+ *
+ * 时间单位：ms 与 ns 都基于 CLOCK_MONOTONIC，基准与 now_ms()/now_ns() 相同。 */
 
-/* 采集器状态。调用方持有（约 40 KB：conn 33 KB + 一帧暂存 5.7 KB + 调度状态）。
-   不能放栈上。 */
+/* 采集器状态。调用方持有（约 40 KB），不能放栈上。 */
 typedef struct {
-    const Config *config;                    /* 调用方持有，生命周期须长于本结构体 */
-    ethercat_south_conn_t conn;              /* 域、过程映像、从站→域映射、tag 偏移 */
+    const Config *config;
+    ethercat_south_conn_t conn;
 
-    /* ---- 分频调度状态 ---- */
+    /* ---- 调度状态 ---- */
     uint64_t base_ms;                        /* 启动时刻（单调 ms），仅用于诊断 */
-    uint64_t next_due_ms[MAX_SLAVES];        /* 各**从站**的下次到点时刻（单调 ms，与 now_ms 同基准） */
-    uint64_t tick_count;                     /* 跑了多少拍 */
-    uint64_t read_count[MAX_SLAVES];         /* 每个从站累计读了多少帧 */
-    uint64_t wc_bad_count;                   /* 有多少拍里至少有一个域的工作计数器不正常 */
-    uint64_t last_report_ms;                 /* 上次打印汇总的时刻（1 Hz 限流用） */
+    uint64_t next_due_ms[MAX_SLAVES];        /* 各从站的下次到点时刻（单调 ms） */
+    uint64_t tick_count;
+    uint64_t read_count[MAX_SLAVES];
+    uint64_t wc_bad_count;
+    uint64_t last_report_ms;
 
-    south_frame_t frame;                     /* 读出来的帧的暂存处。
-                                                本轮不推送，读完即被下一帧覆盖 —— 这不是遗漏。 */
+    /* ---- DC ---- */
+    int       dc_enabled;                    /* 任一从站 mode==dc */
+    uint32_t  dc_period_ns;                  /* 固定 1000000 */
+    uint64_t  dc_err_count;                  /* sync_reference/sync_slave 失败次数 */
+
+    south_frame_t frame;                     /* 当前帧暂存；本轮不推送，读完即被覆盖 */
 } ethercat_south_collector_t;
 
-/* 组装并启动：建主站、按采样周期建域、注册 PDO 条目、激活、取过程映像，
-   然后把调度状态初始化好。需要 root（要 request_master）。
+/* 组装并启动。需要 root（request_master）。
    返回 0 成功；-1 失败。 */
-int ethercat_south_collector_start(ethercat_south_collector_t *c, const Config *config);
+int ethercat_south_collector_start(ethercat_south_collector_t *c,
+                                   const Config *config);
 
-/* 跑一拍：receive → 所有域 process → 到点的域逐从站 read → 所有域 queue → send。
-   now_ms 由调用方给（单调毫秒）—— collector 自己不取时钟，保持可单测。
-   返回 0 成功；-1 参数非法。单个帧读不到不影响整拍（仍返回 0）。 */
-int ethercat_south_collector_tick(ethercat_south_collector_t *c, uint64_t now_ms);
+/* 跑一拍（ms 精度，非 DC / 手工循环用）。
+   内部按 now_ns = now_ms * 1e6 调 tick_ns。 */
+int ethercat_south_collector_tick(ethercat_south_collector_t *c,
+                                  uint64_t now_ms);
 
-/* 【实际运行时接口 —— 部署用这个】
-   自己计时，睡到"最近一个域到点"才跑一拍。
-   好处：CPU 占用最低，任意周期组合都不浪费。
-   代价：拍间隔不规整（1ms 域和 10ms 域混着来），调试时不好对时间。
-   死循环，只在 tick 出错时返回。要优雅退出请改用 _tick()。 */
+/* 跑一拍（ns 精度）。DC 模式下会用 now_ns 设置 application time，
+   并在 queue/send 前做参考时钟与从站时钟同步。 */
+int ethercat_south_collector_tick_ns(ethercat_south_collector_t *c,
+                                     uint64_t now_ns);
+
+/* 【实际运行时接口】死循环。
+   DC：固定 1 ms 绝对时刻唤醒；
+   非 DC：睡到最近一个从站到点。
+   Ctrl+C / SIGTERM 会让它返回 0。退出后必须调 _stop()。 */
 int ethercat_south_collector_run(ethercat_south_collector_t *c);
 
-/* 【调试接口】
-   以各域周期的最大公约数定拍轮询，每拍都进 tick。
-   好处：拍间隔固定、好观察好单步，打印输出好对时间。
-   代价：若周期组合是 3ms+10ms 这种，gcd=1ms 会白跑很多拍。
-   tick_ms 传 0 表示自动取各域周期的最大公约数。
-   死循环，只在 tick 出错时返回。 */
-int ethercat_south_collector_run_debug(ethercat_south_collector_t *c, uint64_t tick_ms);
+/* 【调试接口】固定步长轮询。
+   DC 模式固定 1 ms（忽略 tick_ms）；非 DC 模式 tick_ms=0 时取各从站周期 gcd。 */
+int ethercat_south_collector_run_debug(ethercat_south_collector_t *c,
+                                       uint64_t tick_ms);
 
-/* 单调毫秒时钟（CLOCK_MONOTONIC）。
-   给"调用方自己控循环"的用法配 _tick() 用：now_ms 直接传它的返回值。 */
+/* 单调时钟。 */
 uint64_t ethercat_south_collector_now_ms(void);
+uint64_t ethercat_south_collector_now_ns(void);
 
-/* ---------------------------------------------------------------- 优雅退出 */
-
-/* 请求停止：置一个**粘性**标志（置位后永不清零）。
-   _run() / _run_debug() 的循环每轮看它，看到就退出。
-   异步信号安全 —— 可以直接从信号处理器里调。
-   也可以由调用方自己装处理器后调它。 */
+/* 请求停止：粘性标志，异步信号安全。 */
 void ethercat_south_collector_request_stop(void);
 
-/* 收尾并释放主站。**必须在循环退出之后调**，返回后再调 _tick() 是安全的空操作。
-   幂等：重复调用无害。 */
+/* 收尾并释放主站。**必须在循环退出之后调**；幂等。
+   当前不写任何输出，所以不需要停机刷拍。 */
 void ethercat_south_collector_stop(ethercat_south_collector_t *c);
 
 #endif /* ETHERCAT_SOUTH_COLLECTOR_H */

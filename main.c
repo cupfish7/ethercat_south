@@ -5,11 +5,11 @@
  *     configuration_store_load_startup()     JSON → Config
  *              │
  *              ▼
- *     ethercat_south_collector_start()       建主站 → 按采样周期建域 → 注册 PDO
+ *     ethercat_south_collector_start()       建主站 → 配置 SDO/DC/PDO
  *                                            → 激活 → 取过程映像 → 初始化调度
  *              │
  *              ▼
- *     ethercat_south_collector_run()         按各域自己的周期分频读，死循环
+ *     ethercat_south_collector_run()         按模式跑周期循环，死循环
  *
  * 只能在 Linux 上跑（要 libethercat，而且要 root —— ecrt_request_master 需要）。
  * Windows 上只能做语法检查，见 .vscode/tasks.json 的「语法检查（全部模块）」任务。
@@ -20,39 +20,37 @@
 #include "ethercat_south_parse.h"
 #include "ethercat_south_collector.h"
 
-static Config config;                          /* 约 1.34 MB，必须离开栈 */
+static Config config;                          /* 约 1.5 MB，必须离开栈 */
 static ethercat_south_collector_t collector;   /* 约 40 KB，同样必须离开栈 */
 
 int main(void)
 {
     int rc;
 
-    /* 第一步：解析 JSON 配置（parse 模块，通用工具，别的主站程序也能用） */
+    /* 第一步：解析 JSON 配置。模板错误会让整机启动失败。 */
     if (configuration_store_load_startup(&config) != 0) {
         printf("配置加载失败\n");
         return 1;
     }
 
-    /* 第二步：组装并启动（collector 内部会调 connect） */
+    /* 第二步：组装并启动（collector 内部会调 connect）。 */
     if (ethercat_south_collector_start(&collector, &config) != 0) {
         printf("collector 启动失败\n");
         return 1;
     }
 
     /* 第三步：跑周期循环。
-       调试时换成下面这行（0 = 自动取各域周期的最大公约数当拍长）：
+       调试时换成：
            rc = ethercat_south_collector_run_debug(&collector, 0);
-       需要自己控循环就用 _tick()：
+       需要自己控循环就用 _tick() / _tick_ns()：
            while (...) ethercat_south_collector_tick(&collector,
                               ethercat_south_collector_now_ms());
        Ctrl+C / SIGTERM 会让 _run() 退出并返回 0。 */
     rc = ethercat_south_collector_run(&collector);
 
-    /* 第四步：收尾。**必须调** —— 释放主站前要先把伺服停掉，
-       否则驱动器停在使能态。里面会：发 disable 控制字 → 再跑若干拍把它发出去
-       → 等驱动器退出使能 → 才释放主站。
-       ⚠️ 注意 SIGKILL（kill -9）是收不到的，那种情况下这一步不会执行。 */
+    /* 第四步：收尾释放主站。**必须调**；幂等。
+       ⚠️ SIGKILL（kill -9）收不到，那种情况下这一步不会执行。 */
     ethercat_south_collector_stop(&collector);
 
-    return rc;
+    return rc == 0 ? 0 : 1;
 }

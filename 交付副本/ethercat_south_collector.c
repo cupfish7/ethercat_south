@@ -1,40 +1,18 @@
 /* ============================================================================
  *  ethercat_south_collector.c —— 南向模块的组装层
  *
- *  职责：把 parse / connect / read 串起来，让项目主函数一行就能跑起来。
- *
- *  组装关系
- *  --------
- *      parse      JSON  →  Config           （通用工具，别的主站程序也能用）
- *      connect    Config →  conn            （建主站、按采样周期建域、注册 PDO、激活）
- *      read       conn + 从站下标 → 一帧    （只取数，不驱动周期）
- *      collector  本文件                    （串起上面三个 + 按各域周期分频调 read）
- *
- *  周期循环（两个接口，用途不同）
- *  ------------------------------
- *      _run()            睡到"最近一个域到点"才跑一拍 —— 【实际运行时用】
- *                        CPU 占用最低，代价是拍间隔不规整
- *      _run_debug()      以各域周期的最大公约数定拍轮询  —— 【调试用】
- *                        拍间隔固定好观察，代价是 gcd 小的时候会白跑
- *      _tick()           调用方自己给时间、自己控循环
- *
  *  一拍的步骤
- *  ----------
+ *  ① DC 时：ecrt_master_application_time(target_ns)
+ *  ② ecrt_master_receive()
+ *  ③ ecrt_domain_process()
+ *  ④ 查工作计数器 wc_state
+ *  ⑤ 只有到点的从站才 read
+ *  ⑥ DC 时：sync_reference_clock + sync_slave_clocks
+ *  ⑦ ecrt_domain_queue() → ecrt_master_send()
+ *  ⑧ 1 Hz 打一行汇总
  *
- *    ① ecrt_master_receive()        收
- *    │     └ 紧接着打时间戳 —— 这是 read 要的 source_received_at_ms
- *    ② 所有域 ecrt_domain_process()  注意：不是只处理到点的域
- *    │                                非到点域的数据流也不能断（从站看门狗）
- *    ③ 查工作计数器 wc_state         —— 这是"从站没起来 / 掉线"的唯一防线
- *    │                                没有它，read 会照读一块全是 0 的过程映像，
- *    │                                下游看到的是一条完全健康的流水线
- *    ④ 只有到点的域才逐从站 read
- *    │     └ 读完的帧暂存在 c->frame
- *    │       TODO: 推送 —— 队列建好后在这里投给下游（本轮明确不做）
- *    ⑤ 所有域 ecrt_domain_queue() → ecrt_master_send()
- *    ⑥ 1 Hz 打一行汇总（本轮"不推送"，靠它证明真的在按周期读）
- *
- *  时间单位统一：所有 "ms" 都是单调毫秒，基准与 ethercat_south_collector_now_ms() 相同。
+ *  DC 循环用**目标唤醒时刻**作为 application time（与 IgH dc_user 示例一致），
+ *  而不是醒来后的实测时刻，避免抖动被写进参考时钟。
  * ============================================================================ */
 
 #include <stdio.h>
@@ -48,27 +26,19 @@
 #include "ecrt.h"
 
 #ifdef __linux__
-#include <sys/mman.h>      /* mlockall —— MinGW 没有这个声明，必须包住 */
+#include <sys/mman.h>      /* mlockall */
 #endif
 
-/* ---------- 停止请求（优雅退出用） ---------- */
+#define DC_PERIOD_NS 1000000u   /* 主站周期固定 1 ms */
 
-/* 粘性标志：置位后永不清零。被信号处理器写、被主循环读，
-   所以必须是 volatile sig_atomic_t。
+/* ---------- 停止请求 ---------- */
 
-   **刻意不采用"记信号号、运行时再判断是不是退出信号"那种做法** —— 它有两个毛病：
-     ① 后来的无关信号会把记录下来的信号号覆盖掉；
-     ② 退出信号先到、无关信号紧随其后时会**丢掉退出请求**。
-   粘性标志两个都不会犯：无关信号不碰它，退出请求一旦置位就不会被盖掉。
-
-   信号身份的区分其实在**注册阶段**就完成了 —— 给谁装 collector_on_signal、
-   给谁不装，那一行就定了，运行时不需要再识别。 */
 static volatile sig_atomic_t g_stop = 0;
 
 static void collector_on_signal(int sig)
 {
     (void)sig;
-    g_stop = 1;          /* 处理器里只能做异步信号安全的事：设标志。绝不能 printf。 */
+    g_stop = 1;
 }
 
 void ethercat_south_collector_request_stop(void)
@@ -78,12 +48,17 @@ void ethercat_south_collector_request_stop(void)
 
 /* ---------- 时钟与睡眠 ---------- */
 
-uint64_t ethercat_south_collector_now_ms(void)
+uint64_t ethercat_south_collector_now_ns(void)
 {
     struct timespec ts;
 
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t ethercat_south_collector_now_ms(void)
+{
+    return ethercat_south_collector_now_ns() / 1000000ULL;
 }
 
 static void ms_to_timespec(uint64_t ms, struct timespec *ts)
@@ -92,15 +67,14 @@ static void ms_to_timespec(uint64_t ms, struct timespec *ts)
     ts->tv_nsec = (long)((ms % 1000u) * 1000000u);
 }
 
-/* 睡到指定的单调时刻。clock_nanosleep 直接返回错误码（不设 errno）。
+static void ns_to_timespec(uint64_t ns, struct timespec *ts)
+{
+    ts->tv_sec  = (time_t)(ns / 1000000000ULL);
+    ts->tv_nsec = (long)(ns % 1000000000ULL);
+}
 
-   被信号打断（EINTR）时：**无关信号继续睡，退出信号立刻返回** ——
-   靠的是粘性标志 g_stop：无关信号不碰它，循环条件仍然成立，于是接着睡；
-   一旦有退出请求，条件立刻不成立，马上返给调用方。
-
-   TIMER_ABSTIME 在这里是白捡的便利：目标是**绝对时刻**，重睡不用重算剩余时间，
-   拿同一个 target 再调一次就是"继续睡到原来那个时刻"。
-   （换成相对时长的 nanosleep 就得自己扣时间，还容易累积误差。） */
+/* 睡到指定的单调时刻。被信号打断（EINTR）时：
+   无关信号继续睡，退出信号立刻返回（靠粘性 g_stop）。 */
 static int sleep_until_ms(uint64_t ms)
 {
     struct timespec target;
@@ -114,7 +88,20 @@ static int sleep_until_ms(uint64_t ms)
     return ret;
 }
 
-/* ---------- 周期最大公约数（调试模式定拍用） ---------- */
+static int sleep_until_ns(uint64_t ns)
+{
+    struct timespec target;
+    int ret;
+
+    ns_to_timespec(ns, &target);
+    do {
+        ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL);
+    } while (ret == EINTR && !g_stop);
+
+    return ret;
+}
+
+/* ---------- 周期最大公约数（非 DC 调试模式定拍用） ---------- */
 
 static uint64_t gcd_u64(uint64_t a, uint64_t b)
 {
@@ -126,9 +113,6 @@ static uint64_t gcd_u64(uint64_t a, uint64_t b)
     return a;
 }
 
-/* 各从站采样周期的最大公约数（调试模式的定拍步长）。返回 0 表示一个有效周期都没有。
-   注意：分频现在是**按从站**的 —— 域不再有"周期"这个属性（它按容量分组），
-   所以这里遍历从站而不是域。 */
 static uint64_t slaves_gcd(const ethercat_south_collector_t *c)
 {
     uint64_t g = 0;
@@ -144,8 +128,6 @@ static uint64_t slaves_gcd(const ethercat_south_collector_t *c)
 
 /* ---------- 实时设置 ---------- */
 
-/* 照 examples/user/main.c:347-364 的做法。
-   失败只告警不退出 —— 没有 root 时照样能跑，只是抖动大、更容易丢拍。 */
 static void collector_setup_realtime(void)
 {
     struct sched_param param;
@@ -156,8 +138,6 @@ static void collector_setup_realtime(void)
         printf("警告：sched_setscheduler 失败（需要 root 权限？），以普通优先级运行\n");
 
 #ifdef __linux__
-    /* 锁内存，防止周期任务里发生缺页。
-       MinGW 没有 mlockall 的声明 —— 这里包住，否则本机连语法检查都过不了。 */
     if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1)
         printf("警告：mlockall 失败，内存未锁定\n");
 #endif
@@ -165,7 +145,8 @@ static void collector_setup_realtime(void)
 
 /* ---------- 启动 ---------- */
 
-int ethercat_south_collector_start(ethercat_south_collector_t *c, const Config *config)
+int ethercat_south_collector_start(ethercat_south_collector_t *c,
+                                   const Config *config)
 {
     int i;
 
@@ -174,17 +155,31 @@ int ethercat_south_collector_start(ethercat_south_collector_t *c, const Config *
     memset(c, 0, sizeof(*c));
     c->config = config;
 
-    /* 建主站 → 按容量分域 → 注册 PDO 条目 → 激活 → 取各自的过程映像。
-       这一整段都在 connect 模块里，collector 不重复它的逻辑。 */
+    /* 先扫一遍配置：决定循环模式，并校验 DC 周期与固定 1 ms 主站一致。 */
+    for (i = 0; i < config->slave_count; i++) {
+        const SlaveConfig *s = &config->slaves[i];
+
+        if (strcmp(s->protocol, "ethercat") != 0) continue;
+
+        if (s->mode == SOUTH_MODE_DC) {
+            if (s->dc.sync0_cycle_ns != DC_PERIOD_NS) {
+                printf("[%s] DC 周期 %u ns 与固定 1 ms 主站不符\n",
+                       s->node, s->dc.sync0_cycle_ns);
+                return -1;
+            }
+            c->dc_enabled = 1;
+            c->dc_period_ns = DC_PERIOD_NS;
+        }
+    }
+
     if (ethercat_south_master_start(config, &c->conn) != 0) {
         printf("主站启动失败\n");
         return -1;
     }
 
-    /* 调度状态初始化：**按从站** —— 每个从站第一次到点 = 启动时刻 + 它自己的 period_ms。
-       域不再有"周期"属性（它按容量分组），所以分频只能落在从站上。 */
     c->base_ms        = ethercat_south_collector_now_ms();
     c->last_report_ms = c->base_ms;
+
     for (i = 0; i < config->slave_count; i++) {
         int p = config->slaves[i].period_ms;
         c->next_due_ms[i] = c->base_ms + (uint64_t)((p > 0) ? p : 1);
@@ -192,93 +187,108 @@ int ethercat_south_collector_start(ethercat_south_collector_t *c, const Config *
 
     collector_setup_realtime();
 
-    printf("collector 就绪：1 个域、%d 个从站（域 %lu 字节）\n",
-           config->slave_count, (unsigned long)ecrt_domain_size(c->conn.domain));
+    printf("collector 就绪：%s，%d 个从站，域 %lu 字节\n",
+           c->dc_enabled ? "DC 1 ms" : "按从站周期",
+           config->slave_count, (unsigned long)c->conn.domain_size);
 
     return 0;
 }
 
 /* ---------- 一拍 ---------- */
 
-int ethercat_south_collector_tick(ethercat_south_collector_t *c, uint64_t now_ms)
+int ethercat_south_collector_tick_ns(ethercat_south_collector_t *c,
+                                     uint64_t now_ns)
 {
-    uint64_t received_at;
+    uint64_t now_ms;
     int i;
 
     if (c == NULL || c->config == NULL) return -1;
     if (c->conn.master == NULL) return -1;
 
-    /* ① 收 —— 顺序照 IgH 示例固定：receive → process → (读) → queue → send */
-    ecrt_master_receive(c->conn.master);
-    received_at = now_ms;      /* 紧接 receive 打戳，这就是 read 要的 source_received_at_ms */
+    now_ms = now_ns / 1000000ULL;
 
-    /* ② process —— 只有一个域，每拍都做（数据流不能断） */
+    /* ① DC 应用时间：用目标时刻，不用实测时刻。 */
+    if (c->dc_enabled)
+        ecrt_master_application_time(c->conn.master, now_ns);
+
+    /* ② 收 */
+    ecrt_master_receive(c->conn.master);
+
+    /* ③ process */
     ecrt_domain_process(c->conn.domain);
 
-    /* ③ 查工作计数器 —— 这是"从站没起来 / 掉线"的**唯一防线**。
-          没有它，过程映像里可能全是 0 或上次的残值，而 read 照读不误、帧序列照涨，
-          下游拿到一条看起来完全健康的流水线。ecrt_domain_state 必须在
-          domain_process 之后调才有意义（它读的是上一轮交换的结果）。 */
+    /* ④ 工作计数器 */
     {
         ec_domain_state_t ds;
 
         if (ecrt_domain_state(c->conn.domain, &ds) == 0 &&
             ds.wc_state != EC_WC_COMPLETE)
-            c->wc_bad_count++;           /* 这一拍工作计数器不正常 */
+            c->wc_bad_count++;
     }
 
-    /* ④ 只有到点的**从站**才 read —— 分频按从站（域只有一个，没有周期属性） */
+    /* ⑤ 只有到点的从站才 read */
     for (i = 0; i < c->config->slave_count; i++) {
         int period;
 
-        if (now_ms < c->next_due_ms[i]) continue;          /* 这个从站没到点 */
-        if (c->conn.domain_pd == NULL) continue;           /* 还没 activate */
+        if (now_ms < c->next_due_ms[i]) continue;
+        if (c->conn.domain_pd == NULL) continue;
 
         period = c->config->slaves[i].period_ms;
-        if (period <= 0) continue;                         /* 周期无效，读不了也不排下一拍 */
+        if (period <= 0) continue;
 
-        if (ethercat_south_read_node(&c->conn, i, received_at, &c->frame) == 0) {
+        if (ethercat_south_read_node(&c->conn, i, now_ms, &c->frame) == 0)
             c->read_count[i]++;
-            /* TODO: 推送 —— 队列建好后在这里把 &c->frame 投给下游。
-               本轮只到"周期读取"，读完的帧下一拍就被覆盖。 */
-        }
 
-        /* 排下一拍。落后超过一整拍就跳过去对齐，**不补读** ——
-           一次停顿若引发一串补读，会越滚越糟；宁可丢拍也要跟上节奏。 */
+        /* 落后超过一整拍就跳过去对齐，不补读。 */
         c->next_due_ms[i] += (uint64_t)period;
         while (c->next_due_ms[i] <= now_ms)
             c->next_due_ms[i] += (uint64_t)period;
     }
 
-    /* ⑤ queue + send */
+    /* ⑥ DC 同步：reference clock 使用上一步写入的 application time。 */
+    if (c->dc_enabled) {
+        if (ecrt_master_sync_reference_clock(c->conn.master) != 0)
+            c->dc_err_count++;
+        if (ecrt_master_sync_slave_clocks(c->conn.master) != 0)
+            c->dc_err_count++;
+    }
+
+    /* ⑦ queue + send */
     ecrt_domain_queue(c->conn.domain);
     ecrt_master_send(c->conn.master);
 
     c->tick_count++;
 
-    /* ⑥ 1 Hz 打一行汇总 —— 本轮"不推送"，靠它证明真的在按周期读 */
+    /* ⑧ 1 Hz 汇总 */
     if (now_ms - c->last_report_ms >= 1000u) {
         c->last_report_ms = now_ms;
-        printf("[collector] 运行 %lu s | 拍数 %lu |",
+        printf("[collector] 运行 %lu s | 拍数 %lu | 模式 %s |",
                (unsigned long)((now_ms - c->base_ms) / 1000u),
-               (unsigned long)c->tick_count);
+               (unsigned long)c->tick_count,
+               c->dc_enabled ? "DC 1ms" : "period");
         for (i = 0; i < c->config->slave_count; i++)
             printf(" %s=%lu帧", c->config->slaves[i].node,
                    (unsigned long)c->read_count[i]);
         if (c->wc_bad_count != 0)
-            printf(" | !! 工作计数器异常 %lu 拍（从站没起来或掉线？读到的可能是空气）",
+            printf(" | !! 工作计数器异常 %lu 拍",
                    (unsigned long)c->wc_bad_count);
+        if (c->dc_err_count != 0)
+            printf(" | !! DC 同步失败 %lu 次",
+                   (unsigned long)c->dc_err_count);
         printf("\n");
     }
 
     return 0;
 }
 
+int ethercat_south_collector_tick(ethercat_south_collector_t *c,
+                                  uint64_t now_ms)
+{
+    return ethercat_south_collector_tick_ns(c, now_ms * 1000000ULL);
+}
+
 /* ---------- 两个 run ---------- */
 
-/* 【实际运行时】睡到"最近一个从站到点"，醒了一拍，再算下一个最近点。
-
-   Ctrl+C / SIGTERM 会让它退出（返回 0）。**退出后必须调 _stop() 收尾**（释放主站）。 */
 int ethercat_south_collector_run(ethercat_south_collector_t *c)
 {
     if (c == NULL) return -1;
@@ -286,6 +296,33 @@ int ethercat_south_collector_run(ethercat_south_collector_t *c)
     signal(SIGINT,  collector_on_signal);
     signal(SIGTERM, collector_on_signal);
 
+    if (c->dc_enabled) {
+        /* 固定 1 ms 绝对时刻唤醒。 */
+        uint64_t next_ns = ethercat_south_collector_now_ns() + c->dc_period_ns;
+
+        while (!g_stop) {
+            int rc = sleep_until_ns(next_ns);
+
+            if (g_stop) break;
+            if (rc != 0) return -1;
+
+            if (ethercat_south_collector_tick_ns(c, next_ns) != 0)
+                return -1;
+
+            next_ns += c->dc_period_ns;
+
+            /* 落后一整拍以上直接对齐到现在，不连续补拍。 */
+            {
+                uint64_t actual = ethercat_south_collector_now_ns();
+                if (next_ns <= actual)
+                    next_ns = actual + c->dc_period_ns;
+            }
+        }
+
+        return 0;
+    }
+
+    /* 非 DC：睡到最近一个从站到点。 */
     while (!g_stop) {
         uint64_t nearest = 0;
         int i, rc;
@@ -294,68 +331,93 @@ int ethercat_south_collector_run(ethercat_south_collector_t *c)
             if (nearest == 0 || c->next_due_ms[i] < nearest)
                 nearest = c->next_due_ms[i];
         }
-        if (nearest == 0) return -1;              /* 一个从站都没有，没什么可跑的 */
+        if (nearest == 0) return -1;
 
         rc = sleep_until_ms(nearest);
-        if (g_stop) break;                        /* 因退出请求而返回：不是错误 */
+        if (g_stop) break;
         if (rc != 0) return -1;
 
-        if (ethercat_south_collector_tick(c, ethercat_south_collector_now_ms()) != 0)
+        if (ethercat_south_collector_tick(c,
+                ethercat_south_collector_now_ms()) != 0)
             return -1;
     }
 
     return 0;
 }
 
-/* 【调试】以固定步长定拍轮询：不管有没有域到点，每拍都进 tick。 */
-int ethercat_south_collector_run_debug(ethercat_south_collector_t *c, uint64_t tick_ms)
+int ethercat_south_collector_run_debug(ethercat_south_collector_t *c,
+                                       uint64_t tick_ms)
 {
-    uint64_t step, next;
-
     if (c == NULL) return -1;
-
-    step = (tick_ms != 0) ? tick_ms : slaves_gcd(c);
-    if (step == 0) return -1;
 
     signal(SIGINT,  collector_on_signal);
     signal(SIGTERM, collector_on_signal);
 
-    next = c->base_ms + step;
+    if (c->dc_enabled) {
+        /* DC 调试也必须是 1 ms；tick_ms 在这里不生效。 */
+        uint64_t next_ns = ethercat_south_collector_now_ns() + c->dc_period_ns;
 
-    while (!g_stop) {
-        uint64_t now;
-        int rc;
+        while (!g_stop) {
+            int rc = sleep_until_ns(next_ns);
 
-        rc = sleep_until_ms(next);
-        if (g_stop) break;                        /* 因退出请求而返回：不是错误 */
-        if (rc != 0) return -1;
+            if (g_stop) break;
+            if (rc != 0) return -1;
 
-        if (ethercat_south_collector_tick(c, ethercat_south_collector_now_ms()) != 0)
-            return -1;
+            if (ethercat_south_collector_tick_ns(c, next_ns) != 0)
+                return -1;
 
-        /* 定拍：用绝对时刻累加，不重新取当前时间，避免累积漂移。
-           但落后一整拍以上时直接对齐到现在 —— 否则会连续忙转补拍。 */
-        next += step;
-        now = ethercat_south_collector_now_ms();
-        if (next <= now)
-            next = now + step;
+            next_ns += c->dc_period_ns;
+            {
+                uint64_t actual = ethercat_south_collector_now_ns();
+                if (next_ns <= actual)
+                    next_ns = actual + c->dc_period_ns;
+            }
+        }
+
+        return 0;
+    }
+
+    {
+        uint64_t step = (tick_ms != 0) ? tick_ms : slaves_gcd(c);
+        uint64_t next;
+
+        if (step == 0) return -1;
+        next = c->base_ms + step;
+
+        while (!g_stop) {
+            uint64_t now;
+            int rc;
+
+            rc = sleep_until_ms(next);
+            if (g_stop) break;
+            if (rc != 0) return -1;
+
+            if (ethercat_south_collector_tick(c,
+                    ethercat_south_collector_now_ms()) != 0)
+                return -1;
+
+            next += step;
+            now = ethercat_south_collector_now_ms();
+            if (next <= now)
+                next = now + step;
+        }
     }
 
     return 0;
 }
 
-/* ---------- 优雅退出：收尾 ---------- */
+/* ---------- 收尾 ---------- */
 
 void ethercat_south_collector_stop(ethercat_south_collector_t *c)
 {
     if (c == NULL || c->conn.master == NULL) return;
 
-    /* 这一版没有电机控制 —— 应用从不往过程映像里写输出，所以释放主站前
-       没有什么"要先发下去"的东西。直接释放即可：从站会回 PREOP。
-       （带伺服控制的那一版在这里还要先发 disable 控制字、再跑几拍把它发出去、
-         然后等驱动器退出使能 —— 顺序不能省，这里不需要。） */
+    /* 当前不写任何输出，没有需要先发下去的停机控制字。 */
     ecrt_release_master(c->conn.master);
-    c->conn.master = NULL;          /* 置 NULL：之后 _tick() 变成安全空操作 */
+    c->conn.master = NULL;
+    c->conn.domain = NULL;
+    c->conn.domain_pd = NULL;
+    c->conn.domain_size = 0;
 
     printf("[collector] 已释放主站\n");
 }

@@ -7,15 +7,9 @@
  *        把 parse → connect → collector → read 整条链**用真代码**跑一遍。
  *        真代码一行不改，只是把 IgH 用户态库换成了这个替身。
  *
- *  为什么不做成"改 connect 让它支持假从站"：那样改的是交付物本身，
- *  而且会拆掉"从站不在线就起不来"这个响亮的失败信号 —— 主站会"成功"启动，
- *  read 却照读一块全 0 的过程映像，下游看到的是一条完全健康的流水线。
- *  替身只活在测试里，不存在这个问题。
+ *  假数据刻意摆成一眼就是假的图案（0xA5 / 0x5A 重复）。
  *
- *  假数据刻意摆成一眼就是假的图案（0xA5 / 0x5A 重复），不用 0、也不用
- *  任何"像真实读数"的值 —— 免得有人把测试输出当成真实数据。
- *
- *  与真 IgH 的差异（本替身够用就好，不追求保真）：
+ *  与真 IgH 的差异：
  *    · 偏移按"每条 4 字节、按注册顺序排"给，不按真实位长累加
  *    · 不模拟从站在线/离线（那是 WC 的活，测试里用 g_stub_wc_state 手动切）
  * ============================================================================ */
@@ -27,26 +21,50 @@
 
 /* ---------- 测试可以调的旋钮 ---------- */
 
-/* 改成 EC_WC_INCOMPLETE / EC_WC_ZERO 就能模拟"从站没起来 / 掉线" */
 ec_wc_state_t g_stub_wc_state = EC_WC_COMPLETE;
 unsigned int  g_stub_wc       = 1;
 
-/* 调用计数，方便断言"每拍都 receive/process/queue/send 了" */
+/* 调用计数 */
 int g_stub_receive_calls = 0;
 int g_stub_process_calls = 0;
 int g_stub_queue_calls   = 0;
 int g_stub_send_calls    = 0;
+int g_stub_release_calls = 0;
+
+int g_stub_sdo_calls         = 0;
+int g_stub_dc_calls          = 0;
+int g_stub_select_ref_calls  = 0;
+int g_stub_app_time_calls    = 0;
+int g_stub_sync_ref_calls    = 0;
+int g_stub_sync_slave_calls  = 0;
+
+/* 最后一次调用的参数 */
+uint16_t g_stub_last_sdo_index = 0;
+uint8_t  g_stub_last_sdo_subindex = 0;
+uint8_t  g_stub_last_sdo_data[32];
+size_t   g_stub_last_sdo_len = 0;
+
+uint16_t g_stub_last_dc_assign = 0;
+uint32_t g_stub_last_dc_sync0_cycle = 0;
+int32_t  g_stub_last_dc_sync0_shift = 0;
+uint32_t g_stub_last_dc_sync1_cycle = 0;
+int32_t  g_stub_last_dc_sync1_shift = 0;
+uint64_t g_stub_last_app_time = 0;
+
+/* 失败注入 */
+int g_stub_fail_entry = -1;   /* 匹配这个 entry_index 时返回 -1 */
+int g_stub_fail_sdo   = 0;
+int g_stub_fail_dc    = 0;
 
 /* ---------- 假的域与过程映像 ---------- */
 
 #define STUB_MAX_DOMAINS   16
-#define STUB_DOMAIN_BYTES  64
+#define STUB_DOMAIN_BYTES 256
 
 static uint8_t g_pd[STUB_MAX_DOMAINS][STUB_DOMAIN_BYTES];
 static int     g_domain_n = 0;
 static int     g_domain_off[STUB_MAX_DOMAINS];
 
-/* 假图案：域 0 全 0xA5，域 1 全 0x5A，域 2 全 0xA5…… */
 static uint8_t stub_pattern(int k)
 {
     return (uint8_t)((k & 1) ? 0x5A : 0xA5);
@@ -60,11 +78,56 @@ static int domain_index_of(const ec_domain_t *d)
     return -1;
 }
 
+void stub_reset(void)
+{
+    int k;
+
+    g_domain_n = 0;
+    memset(g_domain_off, 0, sizeof(g_domain_off));
+    memset(g_pd, 0, sizeof(g_pd));
+
+    g_stub_wc_state = EC_WC_COMPLETE;
+    g_stub_wc = 1;
+
+    g_stub_receive_calls = 0;
+    g_stub_process_calls = 0;
+    g_stub_queue_calls   = 0;
+    g_stub_send_calls    = 0;
+    g_stub_release_calls = 0;
+
+    g_stub_sdo_calls        = 0;
+    g_stub_dc_calls         = 0;
+    g_stub_select_ref_calls = 0;
+    g_stub_app_time_calls   = 0;
+    g_stub_sync_ref_calls   = 0;
+    g_stub_sync_slave_calls = 0;
+
+    g_stub_last_sdo_index = 0;
+    g_stub_last_sdo_subindex = 0;
+    g_stub_last_sdo_len = 0;
+    memset(g_stub_last_sdo_data, 0, sizeof(g_stub_last_sdo_data));
+
+    g_stub_last_dc_assign = 0;
+    g_stub_last_dc_sync0_cycle = 0;
+    g_stub_last_dc_sync0_shift = 0;
+    g_stub_last_dc_sync1_cycle = 0;
+    g_stub_last_dc_sync1_shift = 0;
+    g_stub_last_app_time = 0;
+
+    g_stub_fail_entry = -1;
+    g_stub_fail_sdo   = 0;
+    g_stub_fail_dc    = 0;
+
+    for (k = 0; k < STUB_MAX_DOMAINS; k++)
+        memset(g_pd[k], 0, sizeof(g_pd[k]));
+}
+
 /* ---------- 被顶掉的 IgH 用户态 API ---------- */
 
 void ecrt_release_master(ec_master_t *master)
 {
-    (void)master;                   /* 假：什么也不做 */
+    (void)master;
+    g_stub_release_calls++;
 }
 
 ec_master_t *ecrt_request_master(unsigned int master_index)
@@ -88,7 +151,7 @@ ec_slave_config_t *ecrt_master_slave_config(ec_master_t *master, uint16_t alias,
 {
     static int dummy;
     (void)master; (void)alias; (void)position; (void)vendor_id; (void)product_code;
-    return (ec_slave_config_t *)(void *)&dummy;         /* 非 NULL 即可 */
+    return (ec_slave_config_t *)(void *)&dummy;
 }
 
 int ecrt_slave_config_reg_pdo_entry(ec_slave_config_t *sc, uint16_t entry_index,
@@ -96,8 +159,10 @@ int ecrt_slave_config_reg_pdo_entry(ec_slave_config_t *sc, uint16_t entry_index,
                                     unsigned int *bit_position)
 {
     int k = domain_index_of(domain);
-    (void)sc; (void)entry_index; (void)entry_subindex; (void)bit_position;
+    (void)sc; (void)entry_subindex; (void)bit_position;
 
+    if (g_stub_fail_entry >= 0 && entry_index == (uint16_t)g_stub_fail_entry)
+        return -1;
     if (k < 0) return -1;
 
     /* 假装每条占 4 字节、按注册顺序往后排 */
@@ -106,11 +171,78 @@ int ecrt_slave_config_reg_pdo_entry(ec_slave_config_t *sc, uint16_t entry_index,
     return g_domain_off[k] - 4;
 }
 
-int ecrt_slave_config_sdo8(ec_slave_config_t *sc, uint16_t sdo_index,
-                           uint8_t sdo_subindex, uint8_t value)
+int ecrt_slave_config_sdo(ec_slave_config_t *sc, uint16_t index,
+                          uint8_t subindex, const uint8_t *data, size_t size)
 {
-    (void)sc; (void)sdo_index; (void)sdo_subindex; (void)value;
-    return 0;                       /* 假装下下去了；真值只有伺服自己知道 */
+    size_t n;
+
+    (void)sc;
+
+    if (g_stub_fail_sdo) return -1;
+
+    g_stub_sdo_calls++;
+    g_stub_last_sdo_index = index;
+    g_stub_last_sdo_subindex = subindex;
+    g_stub_last_sdo_len = size;
+
+    n = size < sizeof(g_stub_last_sdo_data) ?
+        size : sizeof(g_stub_last_sdo_data);
+    if (data != NULL && n > 0) memcpy(g_stub_last_sdo_data, data, n);
+
+    return 0;
+}
+
+int ecrt_slave_config_sdo8(ec_slave_config_t *sc, uint16_t index,
+                           uint8_t subindex, uint8_t value)
+{
+    uint8_t data = value;
+    return ecrt_slave_config_sdo(sc, index, subindex, &data, 1);
+}
+
+int ecrt_slave_config_dc(ec_slave_config_t *sc, uint16_t assign_activate,
+                         uint32_t sync0_cycle, int32_t sync0_shift,
+                         uint32_t sync1_cycle, int32_t sync1_shift)
+{
+    (void)sc;
+
+    if (g_stub_fail_dc) return -1;
+
+    g_stub_dc_calls++;
+    g_stub_last_dc_assign = assign_activate;
+    g_stub_last_dc_sync0_cycle = sync0_cycle;
+    g_stub_last_dc_sync0_shift = sync0_shift;
+    g_stub_last_dc_sync1_cycle = sync1_cycle;
+    g_stub_last_dc_sync1_shift = sync1_shift;
+    return 0;
+}
+
+int ecrt_master_select_reference_clock(ec_master_t *master, ec_slave_config_t *sc)
+{
+    (void)master; (void)sc;
+    g_stub_select_ref_calls++;
+    return 0;
+}
+
+int ecrt_master_application_time(ec_master_t *master, uint64_t app_time)
+{
+    (void)master;
+    g_stub_app_time_calls++;
+    g_stub_last_app_time = app_time;
+    return 0;
+}
+
+int ecrt_master_sync_reference_clock(ec_master_t *master)
+{
+    (void)master;
+    g_stub_sync_ref_calls++;
+    return 0;
+}
+
+int ecrt_master_sync_slave_clocks(ec_master_t *master)
+{
+    (void)master;
+    g_stub_sync_slave_calls++;
+    return 0;
 }
 
 int ecrt_master_activate(ec_master_t *master)
@@ -118,7 +250,7 @@ int ecrt_master_activate(ec_master_t *master)
     int k;
     (void)master;
 
-    /* 模拟"主站把每个域的过程映像填好了" —— 填成一眼是假的图案 */
+    /* 模拟主站把每个域的过程映像填好了 */
     for (k = 0; k < g_domain_n; k++)
         memset(g_pd[k], stub_pattern(k), sizeof(g_pd[k]));
 
@@ -131,18 +263,46 @@ uint8_t *ecrt_domain_data(const ec_domain_t *domain)
     return (k < 0) ? NULL : &g_pd[k][0];
 }
 
-/* 假：把"已注册的累计偏移"当作域大小。
-   ⚠️ 真 IgH 里这个值在 activate 之前是未文档化行为，这里只是让测试能跑。 */
 size_t ecrt_domain_size(const ec_domain_t *domain)
 {
     int k = domain_index_of(domain);
     return (k < 0) ? (size_t)-1 : (size_t)g_domain_off[k];
 }
 
-int ecrt_master_receive(ec_master_t *master)   { (void)master; g_stub_receive_calls++; return 0; }
-int ecrt_domain_process(ec_domain_t *domain)   { (void)domain; g_stub_process_calls++; return 0; }
-int ecrt_domain_queue(ec_domain_t *domain)     { (void)domain; g_stub_queue_calls++;   return 0; }
-int ecrt_master_send(ec_master_t *master)      { (void)master; g_stub_send_calls++;    return 0; }
+int ecrt_master_receive(ec_master_t *master)
+{
+    int k;
+    (void)master;
+
+    /* connect 在 activate 之后会把过程映像清零；
+       每次 receive 重新铺一遍假图案，保证 read 能读到确定的数据。 */
+    for (k = 0; k < g_domain_n; k++)
+        memset(g_pd[k], stub_pattern(k), sizeof(g_pd[k]));
+
+    g_stub_receive_calls++;
+    return 0;
+}
+
+int ecrt_domain_process(ec_domain_t *domain)
+{
+    (void)domain;
+    g_stub_process_calls++;
+    return 0;
+}
+
+int ecrt_domain_queue(ec_domain_t *domain)
+{
+    (void)domain;
+    g_stub_queue_calls++;
+    return 0;
+}
+
+int ecrt_master_send(ec_master_t *master)
+{
+    (void)master;
+    g_stub_send_calls++;
+    return 0;
+}
 
 int ecrt_domain_state(const ec_domain_t *domain, ec_domain_state_t *state)
 {
